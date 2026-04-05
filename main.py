@@ -12,6 +12,7 @@ from pool import KeyPool, KeyStatus
 from handler import RequestHandler
 from storage import KeyStorage
 from health import HealthChecker
+from middleware import RequestLoggerMiddleware
 
 # 配置日志
 logging.basicConfig(
@@ -97,6 +98,7 @@ async def lifespan(app: FastAPI):
         logger.info("Shutdown complete")
 
 app = FastAPI(title="NIM API Pool", lifespan=lifespan)
+app.add_middleware(RequestLoggerMiddleware)
 
 # === 管理 API ===
 

@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  nim-pool:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - NIM_API_KEYS=${NIM_API_KEYS}
+      - NIM_RPM_LIMIT=40
+      - NIM_LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
