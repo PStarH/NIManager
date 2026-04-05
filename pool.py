@@ -46,6 +46,7 @@ class KeyPool:
         self._keys: dict[str, APIKey] = {}
         self._lock = asyncio.Lock()
         self._key_order: list[str] = []
+        self._current_idx: int = 0
         
     async def add_key(self, key: str, name: str = "") -> APIKey:
         async with self._lock:
@@ -63,6 +64,8 @@ class KeyPool:
                 return False
             del self._keys[key]
             self._key_order.remove(key)
+            if self._current_idx >= len(self._key_order):
+                self._current_idx = 0
             logger.info(f"Removed API key: {key[:8]}...")
             return True
     
@@ -85,30 +88,40 @@ class KeyPool:
     
     async def get_available_key(self, timeout: float = 60.0) -> Optional[APIKey]:
         deadline = time.monotonic() + timeout
-        start_idx = 0
         
         while time.monotonic() < deadline:
             async with self._lock:
                 now = time.monotonic()
-                for i in range(len(self._key_order)):
-                    idx = (start_idx + i) % len(self._key_order)
-                    key_str = self._key_order[idx]
-                    key = self._keys[key_str]
-                    if key.status != KeyStatus.ACTIVE:
-                        continue
-                    self._clean_old_timestamps(key, now)
-                    if len(key.timestamps) < self.rpm_limit:
-                        key.timestamps.append(now)
-                        key.metrics.last_used = now
-                        start_idx = (idx + 1) % len(self._key_order)
-                        return key
+                
+                # 尝试恢复限流的key
                 for key in self._keys.values():
                     if key.status == KeyStatus.RATE_LIMITED:
                         self._clean_old_timestamps(key, now)
                         if len(key.timestamps) < self.rpm_limit:
                             key.status = KeyStatus.ACTIVE
                             logger.info(f"Key {key.name} recovered from rate limit")
-            await asyncio.sleep(0.1)
+                
+                # 轮询选择可用key
+                if not self._key_order:
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                for _ in range(len(self._key_order)):
+                    key_str = self._key_order[self._current_idx]
+                    self._current_idx = (self._current_idx + 1) % len(self._key_order)
+                    
+                    key = self._keys[key_str]
+                    if key.status != KeyStatus.ACTIVE:
+                        continue
+                    
+                    self._clean_old_timestamps(key, now)
+                    if len(key.timestamps) < self.rpm_limit:
+                        key.timestamps.append(now)
+                        key.metrics.last_used = now
+                        return key
+            
+            await asyncio.sleep(0.05)
+        
         return None
     
     async def report_success(self, key: str, latency_ms: float):

@@ -10,6 +10,29 @@ from pool import KeyPool
 
 logger = logging.getLogger(__name__)
 
+# 全局连接池
+_client: httpx.AsyncClient = None
+
+async def get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=10.0),
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30.0
+            ),
+            http2=True
+        )
+    return _client
+
+async def close_client():
+    global _client
+    if _client:
+        await _client.aclose()
+        _client = None
+
 class RequestHandler:
     def __init__(self, pool: KeyPool, base_url: str, timeout: int = 120, max_retries: int = 2):
         self.pool = pool
@@ -48,34 +71,33 @@ class RequestHandler:
                 if is_stream:
                     return await self._handle_stream(method, target_url, body, headers, key, model)
                 
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    resp = await client.request(method, target_url, content=body, headers=headers)
-                    latency_ms = (time.time() - start_time) * 1000
-                    
-                    if resp.status_code == 429:
-                        await self.pool.report_failure(key, is_rate_limit=True)
-                        if attempt < self.max_retries:
-                            continue
-                        raise HTTPException(status_code=429, detail="Rate limited")
-                    
-                    if resp.status_code >= 500:
-                        await self.pool.report_failure(key)
-                        if attempt < self.max_retries:
-                            await asyncio.sleep(0.5 * (attempt + 1))
-                            continue
-                    
-                    if resp.status_code >= 400:
-                        return JSONResponse(content=resp.json(), status_code=resp.status_code)
-                    
-                    # 记录 token 使用
-                    resp_json = resp.json()
-                    usage = resp_json.get("usage", {})
-                    if usage:
-                        logger.info(f"[{model}] tokens: {usage.get('prompt_tokens', 0)}+{usage.get('completion_tokens', 0)}={usage.get('total_tokens', 0)} | latency: {latency_ms:.0f}ms")
-                    
-                    await self.pool.report_success(key, latency_ms)
-                    return JSONResponse(content=resp_json, status_code=resp.status_code)
-                    
+                client = await get_client()
+                resp = await client.request(method, target_url, content=body, headers=headers)
+                latency_ms = (time.time() - start_time) * 1000
+                
+                if resp.status_code == 429:
+                    await self.pool.report_failure(key, is_rate_limit=True)
+                    if attempt < self.max_retries:
+                        continue
+                    raise HTTPException(status_code=429, detail="Rate limited")
+                
+                if resp.status_code >= 500:
+                    await self.pool.report_failure(key)
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        continue
+                
+                if resp.status_code >= 400:
+                    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+                
+                resp_json = resp.json()
+                usage = resp_json.get("usage", {})
+                if usage:
+                    logger.info(f"[{model}] tokens: {usage.get('prompt_tokens', 0)}+{usage.get('completion_tokens', 0)}={usage.get('total_tokens', 0)} | latency: {latency_ms:.0f}ms")
+                
+                await self.pool.report_success(key, latency_ms)
+                return JSONResponse(content=resp_json, status_code=resp.status_code)
+                
             except httpx.TimeoutException:
                 await self.pool.report_failure(key)
                 if attempt < self.max_retries:
@@ -93,17 +115,17 @@ class RequestHandler:
         async def generate():
             start_time = time.time()
             try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    async with client.stream(method, url, content=body, headers=headers) as resp:
-                        if resp.status_code == 429:
-                            await self.pool.report_failure(key, is_rate_limit=True)
-                            yield json.dumps({"error": "Rate limited"}).encode()
-                            return
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
-                        latency_ms = (time.time() - start_time) * 1000
-                        logger.info(f"[{model}] stream completed | latency: {latency_ms:.0f}ms")
-                        await self.pool.report_success(key, latency_ms)
+                client = await get_client()
+                async with client.stream(method, url, content=body, headers=headers) as resp:
+                    if resp.status_code == 429:
+                        await self.pool.report_failure(key, is_rate_limit=True)
+                        yield json.dumps({"error": "Rate limited"}).encode()
+                        return
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+                    latency_ms = (time.time() - start_time) * 1000
+                    logger.info(f"[{model}] stream completed | latency: {latency_ms:.0f}ms")
+                    await self.pool.report_success(key, latency_ms)
             except Exception as e:
                 await self.pool.report_failure(key)
                 yield json.dumps({"error": str(e)}).encode()

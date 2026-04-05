@@ -9,19 +9,17 @@ from typing import Optional
 
 from config import settings
 from pool import KeyPool, KeyStatus
-from handler import RequestHandler
+from handler import RequestHandler, close_client
 from storage import KeyStorage
 from health import HealthChecker
 from middleware import RequestLoggerMiddleware
 
-# 配置日志
 logging.basicConfig(
     level=getattr(logging, settings.log_level),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# 全局实例
 pool: KeyPool = None
 handler: RequestHandler = None
 storage: KeyStorage = None
@@ -31,25 +29,21 @@ health_checker: HealthChecker = None
 async def lifespan(app: FastAPI):
     global pool, handler, storage, health_checker
     
-    # 初始化存储
     storage = KeyStorage(settings.database_url.replace("sqlite+aiosqlite:///", ""))
     await storage.init()
     
-    # 初始化账号池
     pool = KeyPool(
         rpm_limit=settings.rpm_limit,
         window_seconds=settings.window_seconds,
         max_consecutive_failures=settings.max_consecutive_failures
     )
     
-    # 从存储加载keys
     saved_keys = await storage.load_all_keys()
     for k in saved_keys:
         await pool.add_key(k["key"], k["name"])
         if k["status"] == "disabled":
             await pool.disable_key(k["key"])
     
-    # 从环境变量加载keys
     if settings.api_keys:
         for key in settings.api_keys:
             try:
@@ -60,7 +54,6 @@ async def lifespan(app: FastAPI):
     
     logger.info(f"Loaded {len(pool._keys)} API keys")
     
-    # 初始化处理器
     handler = RequestHandler(
         pool=pool,
         base_url=settings.nim_base_url,
@@ -68,7 +61,6 @@ async def lifespan(app: FastAPI):
         max_retries=settings.max_retries
     )
     
-    # 启动健康检查
     health_checker = HealthChecker(
         pool=pool,
         base_url=settings.nim_base_url,
@@ -76,31 +68,16 @@ async def lifespan(app: FastAPI):
     )
     await health_checker.start()
     
-    # 优雅关闭
-    shutdown_event = asyncio.Event()
+    yield
     
-    def signal_handler():
-        logger.info("Shutdown signal received")
-        shutdown_event.set()
-    
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            asyncio.get_event_loop().add_signal_handler(sig, signal_handler)
-        except NotImplementedError:
-            pass
-    
-    try:
-        yield
-    finally:
-        logger.info("Shutting down...")
-        await health_checker.stop()
-        await storage.close()
-        logger.info("Shutdown complete")
+    logger.info("Shutting down...")
+    await health_checker.stop()
+    await close_client()
+    await storage.close()
+    logger.info("Shutdown complete")
 
 app = FastAPI(title="NIM API Pool", lifespan=lifespan)
 app.add_middleware(RequestLoggerMiddleware)
-
-# === 管理 API ===
 
 class AddKeyRequest(BaseModel):
     key: str
@@ -160,7 +137,6 @@ async def health():
 
 @app.get("/admin/latency")
 async def test_latency(model: str = "meta/llama-3.1-8b-instruct", prompt: str = "Hello"):
-    """测试指定模型的延迟"""
     import httpx
     import time
     
@@ -193,7 +169,6 @@ async def test_latency(model: str = "meta/llama-3.1-8b-instruct", prompt: str = 
 
 @app.get("/admin/models")
 async def list_models():
-    """列出可用模型"""
     import httpx
     
     key_obj = await pool.get_available_key()
@@ -206,8 +181,6 @@ async def list_models():
             headers={"Authorization": f"Bearer {key_obj.key}"}
         )
         return resp.json()
-
-# === 代理 API ===
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy(path: str, request: Request):
