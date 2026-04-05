@@ -130,10 +130,26 @@ async def get_status():
 
 @app.get("/health")
 async def health():
+    import psutil
+    import platform
+    
     status = await pool.get_status()
-    if status["active_keys"] > 0:
-        return {"status": "healthy", "active_keys": status["active_keys"]}
-    return JSONResponse(status_code=503, content={"status": "unhealthy", "message": "No active keys"})
+    
+    health_data = {
+        "status": "healthy" if status["active_keys"] > 0 else "unhealthy",
+        "active_keys": status["active_keys"],
+        "total_keys": status["total_keys"],
+        "system": {
+            "cpu_percent": psutil.cpu_percent(),
+            "memory_percent": psutil.virtual_memory().percent,
+            "python_version": platform.python_version(),
+            "platform": platform.system()
+        }
+    }
+    
+    if status["active_keys"] == 0:
+        return JSONResponse(status_code=503, content=health_data)
+    return health_data
 
 @app.get("/admin/latency")
 async def test_latency(model: str = "meta/llama-3.1-8b-instruct", prompt: str = "Hello"):
