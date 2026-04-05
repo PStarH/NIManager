@@ -50,6 +50,16 @@ class RequestHandler:
                     resp = await client.request(method, target_url, content=body, headers=headers)
                     latency_ms = (time.time() - start_time) * 1000
                     
+                    # 记录 token 使用
+                    if resp.status_code == 200:
+                        try:
+                            resp_json = resp.json()
+                            usage = resp_json.get("usage", {})
+                            if usage:
+                                logger.info(f"Token usage - prompt: {usage.get('prompt_tokens', 0)}, completion: {usage.get('completion_tokens', 0)}, total: {usage.get('total_tokens', 0)}")
+                        except:
+                            pass
+                    
                     if resp.status_code == 429:
                         await self.pool.report_failure(key, is_rate_limit=True)
                         if attempt < self.max_retries:
