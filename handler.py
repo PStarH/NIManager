@@ -27,11 +27,13 @@ class RequestHandler:
         
         body = None
         is_stream = False
+        model = "unknown"
         if method in ("POST", "PUT", "PATCH"):
             body = await request.body()
             try:
                 parsed = json.loads(body)
                 is_stream = parsed.get("stream", False)
+                model = parsed.get("model", "unknown")
             except Exception:
                 pass
         
@@ -44,21 +46,11 @@ class RequestHandler:
             start_time = time.time()
             try:
                 if is_stream:
-                    return await self._handle_stream(method, target_url, body, headers, key)
+                    return await self._handle_stream(method, target_url, body, headers, key, model)
                 
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
                     resp = await client.request(method, target_url, content=body, headers=headers)
                     latency_ms = (time.time() - start_time) * 1000
-                    
-                    # 记录 token 使用
-                    if resp.status_code == 200:
-                        try:
-                            resp_json = resp.json()
-                            usage = resp_json.get("usage", {})
-                            if usage:
-                                logger.info(f"Token usage - prompt: {usage.get('prompt_tokens', 0)}, completion: {usage.get('completion_tokens', 0)}, total: {usage.get('total_tokens', 0)}")
-                        except:
-                            pass
                     
                     if resp.status_code == 429:
                         await self.pool.report_failure(key, is_rate_limit=True)
@@ -75,8 +67,14 @@ class RequestHandler:
                     if resp.status_code >= 400:
                         return JSONResponse(content=resp.json(), status_code=resp.status_code)
                     
+                    # 记录 token 使用
+                    resp_json = resp.json()
+                    usage = resp_json.get("usage", {})
+                    if usage:
+                        logger.info(f"[{model}] tokens: {usage.get('prompt_tokens', 0)}+{usage.get('completion_tokens', 0)}={usage.get('total_tokens', 0)} | latency: {latency_ms:.0f}ms")
+                    
                     await self.pool.report_success(key, latency_ms)
-                    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+                    return JSONResponse(content=resp_json, status_code=resp.status_code)
                     
             except httpx.TimeoutException:
                 await self.pool.report_failure(key)
@@ -91,7 +89,7 @@ class RequestHandler:
         
         raise HTTPException(status_code=503, detail="Service unavailable after retries")
     
-    async def _handle_stream(self, method: str, url: str, body: bytes, headers: dict, key: str):
+    async def _handle_stream(self, method: str, url: str, body: bytes, headers: dict, key: str, model: str):
         async def generate():
             start_time = time.time()
             try:
@@ -104,6 +102,7 @@ class RequestHandler:
                         async for chunk in resp.aiter_bytes():
                             yield chunk
                         latency_ms = (time.time() - start_time) * 1000
+                        logger.info(f"[{model}] stream completed | latency: {latency_ms:.0f}ms")
                         await self.pool.report_success(key, latency_ms)
             except Exception as e:
                 await self.pool.report_failure(key)
